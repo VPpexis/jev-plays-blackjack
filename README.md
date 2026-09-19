@@ -1,12 +1,17 @@
-# jev-decision-client
+# jev-plays-blackjack
+
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](https://go.dev)
 
 A Go client for the [OpenRouter Decisions API](https://openrouter.ai) plus a rule-accurate
 blackjack simulator in which the Jev model plays every hand and chooses its own bet size.
 
-The model is asked two kinds of questions through the Decisions API:
+Repository: **https://github.com/VPpexis/jev-plays-blackjack**
+
+The model is asked three kinds of questions through the Decisions API:
 
 - **Betting**: how much of the current bankroll to wager (5%, 10%, 50% or all-in).
-- **Action**: what to do with the hand (hit, stand, double, split, surrender, insurance).
+- **Action**: what to do with the hand (hit, stand, double, split or surrender).
+- **Insurance**: whether to take insurance when the dealer shows an ace (optional, off by default).
 
 Every decision, its probabilities, the resulting cards, and the bankroll outcome are recorded
 to a JSON report with full statistics.
@@ -37,6 +42,14 @@ to a JSON report with full statistics.
 - An OpenRouter API key with access to the Jev decisions endpoint
 
 ## Setup
+
+Clone the repository and fetch dependencies:
+
+```bash
+git clone https://github.com/VPpexis/jev-plays-blackjack.git
+cd jev-plays-blackjack
+go mod download
+```
 
 Create a `.env` file in the project root (it is git-ignored):
 
@@ -257,9 +270,12 @@ action and whether the model agreed with it, fallback and error flags, latency a
 ├── *_test.go          Unit tests for every module
 ├── jev/
 │   └── client.go      Reusable OpenRouter Decisions API client and answer parsing
-└── cmd/
-    └── jevtest/
-        └── main.go    Minimal decisions-API demo (urgency classification example)
+├── cmd/
+│   └── jevtest/
+│       └── main.go    Minimal decisions-API demo (urgency classification example)
+├── go.mod / go.sum    Module definition and dependency checksums
+├── .gitignore         Ignores the API key file, binaries and generated reports
+└── README.md          This file
 ```
 
 ---
