@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -101,5 +103,62 @@ func TestModelFallbackOnError(t *testing.T) {
 	bet := dec.ChooseBet(context.Background(), BetRequest{Bankroll: 100, Unit: 1, MinBet: 1, TotalRounds: 5})
 	if !bet.Fallback || bet.Option != "bet_5" {
 		t.Fatalf("expected bet_5 fallback, got %s fallback=%v", bet.Option, bet.Fallback)
+	}
+}
+
+func TestModelChooseContinue(t *testing.T) {
+	for _, tc := range []struct {
+		p        float64
+		wantStop bool
+	}{
+		{0.8, true},
+		{0.2, false},
+	} {
+		t.Run(fmt.Sprintf("p=%.1f", tc.p), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"model":   "mock",
+					"answers": map[string]any{"continue": map[string]any{"type": "noul", "noul": tc.p}},
+					"usage":   map[string]any{"input_tokens": 50, "output_tokens": 5, "cost": 0.00001},
+				})
+			}))
+			defer srv.Close()
+
+			client := jev.NewClient("test")
+			client.BaseURL = srv.URL
+			dec := NewModelDecider(client, "mock", baseRules(), 2*time.Second, "basic", false, 100)
+
+			resp := dec.ChooseContinue(context.Background(), ContinueRequest{
+				Round: 5, TotalRounds: 100, Bankroll: 110, StartBankroll: 100, Profit: 10, Peak: 115, MinBankroll: 95,
+			})
+			if resp.Stop != tc.wantStop || resp.Continue == tc.wantStop {
+				t.Fatalf("p=%.1f: got stop=%v continue=%v", tc.p, resp.Stop, resp.Continue)
+			}
+			if math.Abs(resp.Probability-tc.p) > 1e-9 {
+				t.Fatalf("p=%.1f: probability %v", tc.p, resp.Probability)
+			}
+			if resp.Usage.Calls == 0 || resp.Fallback || resp.Error != "" {
+				t.Fatalf("unexpected usage or fallback: %+v", resp)
+			}
+		})
+	}
+}
+
+func TestModelContinueFallbackOnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := jev.NewClient("test")
+	client.BaseURL = srv.URL
+	dec := NewModelDecider(client, "mock", baseRules(), time.Second, "basic", false, 10)
+
+	resp := dec.ChooseContinue(context.Background(), ContinueRequest{Round: 2, TotalRounds: 10})
+	if !resp.Continue || resp.Stop {
+		t.Fatalf("expected the session to continue after an API error, got %+v", resp)
+	}
+	if !resp.Fallback || resp.Error == "" {
+		t.Fatalf("expected a recorded fallback, got %+v", resp)
 	}
 }

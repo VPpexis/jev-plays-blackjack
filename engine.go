@@ -77,6 +77,7 @@ type RoundRecord struct {
 	Net             float64          `json:"net"`
 	Outcome         string           `json:"outcome"`
 	Decisions       []DecisionRecord `json:"decisions"`
+	SessionEnd      bool             `json:"session_end,omitempty"`
 	ShoeRemaining   int              `json:"shoe_remaining"`
 	RunningCount    int              `json:"running_count"`
 }
@@ -161,10 +162,36 @@ type InsuranceResponse struct {
 	Error       string
 }
 
+type ContinueRequest struct {
+	Round         int
+	TotalRounds   int
+	Bankroll      float64
+	StartBankroll float64
+	Profit        float64
+	Peak          float64
+	MinBankroll   float64
+	Drawdown      float64
+	History       []RoundSummary
+	RunningCount  int
+	Remaining     map[string]int
+	ShowCount     bool
+	Rules         Rules
+}
+
+type ContinueResponse struct {
+	Continue    bool
+	Stop        bool
+	Probability float64
+	Usage       CallUsage
+	Fallback    bool
+	Error       string
+}
+
 type Decider interface {
 	ChooseBet(ctx context.Context, req BetRequest) BetResponse
 	ChooseAction(ctx context.Context, req ActionRequest) ActionResponse
 	ChooseInsurance(ctx context.Context, req InsuranceRequest) InsuranceResponse
+	ChooseContinue(ctx context.Context, req ContinueRequest) ContinueResponse
 }
 
 type playerHand struct {
@@ -197,6 +224,11 @@ type Game struct {
 	peak          float64
 	low           float64
 	maxDD         float64
+	stopPolicy    string
+	stopOnlyAhead bool
+	stopMinRounds int
+	stopEvery     int
+	totalRounds   int
 }
 
 func NewGame(rules Rules, startBankroll, minBet, unit float64, decider Decider, rng *rand.Rand, showCount bool) *Game {
@@ -223,6 +255,17 @@ func (g *Game) EnableEV(rollouts int, rng *rand.Rand) {
 	if rollouts > 0 {
 		g.ev = &evEstimator{rules: g.rules, rng: rng, rollouts: rollouts}
 	}
+}
+
+func (g *Game) EnableStopPolicy(policy string, onlyAhead bool, minRounds, every, totalRounds int) {
+	if every < 1 {
+		every = 1
+	}
+	g.stopPolicy = policy
+	g.stopOnlyAhead = onlyAhead
+	g.stopMinRounds = minRounds
+	g.stopEvery = every
+	g.totalRounds = totalRounds
 }
 
 func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
@@ -368,7 +411,49 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 	if g.bankroll < g.minBet {
 		g.ruined = true
 	}
+
+	if g.shouldAskContinue() {
+		resp := g.decider.ChooseContinue(ctx, g.continueRequest())
+		rec.Decisions = append(rec.Decisions, continueDecisionRecord(g.round, resp))
+		if resp.Stop {
+			rec.SessionEnd = true
+		}
+	}
 	return rec, nil
+}
+
+func (g *Game) shouldAskContinue() bool {
+	if g.stopPolicy != "model" || g.ruined {
+		return false
+	}
+	if g.round < g.stopMinRounds || g.round >= g.totalRounds {
+		return false
+	}
+	if g.round%g.stopEvery != 0 {
+		return false
+	}
+	if g.stopOnlyAhead && g.bankroll <= g.startBankroll {
+		return false
+	}
+	return true
+}
+
+func (g *Game) continueRequest() ContinueRequest {
+	return ContinueRequest{
+		Round:         g.round,
+		TotalRounds:   g.totalRounds,
+		Bankroll:      g.bankroll,
+		StartBankroll: g.startBankroll,
+		Profit:        g.bankroll - g.startBankroll,
+		Peak:          g.peak,
+		MinBankroll:   g.low,
+		Drawdown:      g.peak - g.bankroll,
+		History:       g.history,
+		RunningCount:  g.shoe.RunningCount(),
+		Remaining:     g.shoe.Composition(),
+		ShowCount:     g.showCount,
+		Rules:         g.rules,
+	}
 }
 
 func (g *Game) betAmount(resp BetResponse) float64 {
@@ -663,5 +748,25 @@ func insuranceDecisionRecord(round int, resp InsuranceResponse) DecisionRecord {
 		Error:      resp.Error,
 		LatencyMs:  resp.Usage.LatencyMs,
 		Usage:      resp.Usage,
+	}
+}
+
+func continueDecisionRecord(round int, resp ContinueResponse) DecisionRecord {
+	action := "continue"
+	confidence := 1 - resp.Probability
+	if resp.Stop {
+		action = "stop"
+		confidence = resp.Probability
+	}
+	return DecisionRecord{
+		Kind:          "continue",
+		Round:         round,
+		Action:        action,
+		Probabilities: map[string]float64{"stop": resp.Probability, "continue": 1 - resp.Probability},
+		Confidence:    confidence,
+		Fallback:      resp.Fallback,
+		Error:         resp.Error,
+		LatencyMs:     resp.Usage.LatencyMs,
+		Usage:         resp.Usage,
 	}
 }

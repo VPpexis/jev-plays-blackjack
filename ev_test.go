@@ -82,6 +82,10 @@ func (d *alwaysHitDecider) ChooseInsurance(ctx context.Context, req InsuranceReq
 	return InsuranceResponse{}
 }
 
+func (d *alwaysHitDecider) ChooseContinue(ctx context.Context, req ContinueRequest) ContinueResponse {
+	return ContinueResponse{Continue: true}
+}
+
 func TestEVLossRecordedForDeviations(t *testing.T) {
 	rules := baseRules()
 	game := NewGame(rules, 100000, 10, 1, &alwaysHitDecider{}, rand.New(rand.NewSource(4)), false)

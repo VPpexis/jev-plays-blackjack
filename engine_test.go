@@ -10,8 +10,10 @@ import (
 type scriptDecider struct {
 	bets    []string
 	actions []Action
+	stops   []bool
 	bi      int
 	ai      int
+	si      int
 }
 
 func (d *scriptDecider) ChooseBet(ctx context.Context, req BetRequest) BetResponse {
@@ -36,6 +38,15 @@ func (d *scriptDecider) ChooseAction(ctx context.Context, req ActionRequest) Act
 
 func (d *scriptDecider) ChooseInsurance(ctx context.Context, req InsuranceRequest) InsuranceResponse {
 	return InsuranceResponse{Take: false}
+}
+
+func (d *scriptDecider) ChooseContinue(ctx context.Context, req ContinueRequest) ContinueResponse {
+	if d.si < len(d.stops) {
+		stop := d.stops[d.si]
+		d.si++
+		return ContinueResponse{Continue: !stop, Stop: stop, Probability: 0.8}
+	}
+	return ContinueResponse{Continue: true}
 }
 
 func TestDealerShouldHit(t *testing.T) {
@@ -305,5 +316,186 @@ func TestRuin(t *testing.T) {
 	}
 	if _, err := game.PlayRound(context.Background()); err == nil {
 		t.Fatal("expected error when playing after ruin")
+	}
+}
+
+func continueDecisions(rec RoundRecord) []DecisionRecord {
+	var out []DecisionRecord
+	for _, d := range rec.Decisions {
+		if d.Kind == "continue" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func TestSessionStopDecision(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}, stops: []bool{false, false, true}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(13)), false)
+	game.EnableStopPolicy("model", false, 1, 1, 100)
+
+	rounds := 0
+	for i := 0; i < 100; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatalf("round %d: %v", i+1, err)
+		}
+		rounds++
+		got := continueDecisions(rec)
+		if len(got) != 1 {
+			t.Fatalf("round %d: expected one continue decision, got %d", rounds, len(got))
+		}
+		wantAction := "continue"
+		if i == 2 {
+			wantAction = "stop"
+		}
+		if got[0].Action != wantAction {
+			t.Fatalf("round %d: continue action %q, want %q", rounds, got[0].Action, wantAction)
+		}
+		if rec.SessionEnd != (i == 2) {
+			t.Fatalf("round %d: session_end %v", rounds, rec.SessionEnd)
+		}
+		if rec.SessionEnd {
+			break
+		}
+	}
+	if rounds != 3 {
+		t.Fatalf("expected the session to end after 3 rounds, played %d", rounds)
+	}
+	if game.RoundsPlayed() != 3 {
+		t.Fatalf("game played %d rounds, want 3", game.RoundsPlayed())
+	}
+}
+
+func TestStopNotAskedOnFinalRound(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(14)), false)
+	game.EnableStopPolicy("model", false, 1, 1, 4)
+
+	for i := 0; i < 4; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := continueDecisions(rec)
+		if i < 3 && len(got) != 1 {
+			t.Fatalf("round %d: expected a continue decision, got %d", i+1, len(got))
+		}
+		if i == 3 && len(got) != 0 {
+			t.Fatalf("round 4 is the last: no continue decision expected, got %d", len(got))
+		}
+	}
+}
+
+func TestStopOnlyAheadGate(t *testing.T) {
+	g := &Game{stopPolicy: "model", stopOnlyAhead: true, stopMinRounds: 1, stopEvery: 1, totalRounds: 100, startBankroll: 100}
+	g.round = 5
+	g.bankroll = 100
+	if g.shouldAskContinue() {
+		t.Fatal("must not offer the stop while flat")
+	}
+	g.bankroll = 99
+	if g.shouldAskContinue() {
+		t.Fatal("must not offer the stop while behind")
+	}
+	g.bankroll = 101
+	if !g.shouldAskContinue() {
+		t.Fatal("must offer the stop while ahead")
+	}
+
+	loose := &Game{stopPolicy: "model", stopMinRounds: 1, stopEvery: 1, totalRounds: 100, startBankroll: 100}
+	loose.round = 5
+	loose.bankroll = 50
+	if !loose.shouldAskContinue() {
+		t.Fatal("without the gate the stop is offered while behind")
+	}
+}
+
+func TestStopOfferedWhenAhead(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}, stops: []bool{true}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(19)), false)
+	game.EnableStopPolicy("model", true, 1, 1, 100)
+	game.bankroll = 2000
+
+	rec, err := game.PlayRound(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := continueDecisions(rec)
+	if len(got) != 1 || got[0].Action != "stop" || !rec.SessionEnd {
+		t.Fatalf("expected the stop to be offered and taken while ahead: %+v", got)
+	}
+}
+
+func TestStopNotOfferedWhenBehind(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_5"}, stops: []bool{true}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(20)), false)
+	game.EnableStopPolicy("model", true, 1, 1, 100)
+	game.bankroll = 500
+
+	rec, err := game.PlayRound(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(continueDecisions(rec)) != 0 || rec.SessionEnd {
+		t.Fatal("the stop must not be offered while behind the starting bankroll")
+	}
+}
+
+func TestStopMinRounds(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(16)), false)
+	game.EnableStopPolicy("model", false, 3, 1, 100)
+
+	for i := 0; i < 3; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := continueDecisions(rec)
+		if i < 2 && len(got) != 0 {
+			t.Fatalf("round %d: stop offered before the minimum of 3 rounds", i+1)
+		}
+		if i == 2 && len(got) != 1 {
+			t.Fatalf("round 3: expected the stop decision, got %d", len(got))
+		}
+	}
+}
+
+func TestStopEveryN(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(17)), false)
+	game.EnableStopPolicy("model", false, 1, 2, 100)
+
+	for i := 0; i < 6; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		if (i+1)%2 == 0 {
+			want = 1
+		}
+		if got := len(continueDecisions(rec)); got != want {
+			t.Fatalf("round %d: %d continue decisions, want %d", i+1, got, want)
+		}
+	}
+}
+
+func TestStopDisabledByDefault(t *testing.T) {
+	dec := &scriptDecider{bets: []string{"bet_10"}, stops: []bool{true}}
+	game := NewGame(baseRules(), 1000, 1, 1, dec, rand.New(rand.NewSource(18)), false)
+
+	for i := 0; i < 5; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(continueDecisions(rec)) != 0 || rec.SessionEnd {
+			t.Fatalf("round %d: stop decisions should be off by default", i+1)
+		}
+	}
+	if dec.si != 0 {
+		t.Fatal("the decider should never be asked to continue when the policy is fixed")
 	}
 }

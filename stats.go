@@ -74,6 +74,10 @@ type RunConfig struct {
 	ShowCount     bool    `json:"show_count"`
 	Bot           string  `json:"bot"`
 	EVRollouts    int     `json:"ev_rollouts"`
+	StopPolicy    string  `json:"stop_policy"`
+	StopOnlyAhead bool    `json:"stop_only_ahead"`
+	StopMinRounds int     `json:"stop_min_rounds"`
+	StopEvery     int     `json:"stop_every"`
 }
 
 type Summary struct {
@@ -81,6 +85,9 @@ type Summary struct {
 	Net           float64 `json:"net"`
 	FinalBankroll float64 `json:"final_bankroll"`
 	Ruined        bool    `json:"ruined"`
+	StoppedEarly  bool    `json:"stopped_early"`
+	StopRound     int     `json:"stop_round"`
+	StopReason    string  `json:"stop_reason"`
 }
 
 type Report struct {

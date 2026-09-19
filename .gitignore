@@ -1,6 +1,9 @@
 .env
 *.exe
 blackjack_results.json
+model_*.json
+run_*.log
+result_analysis/
 response_output.txt
 response_output.json
 jev_decision.json

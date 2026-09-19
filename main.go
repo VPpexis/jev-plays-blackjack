@@ -44,6 +44,10 @@ func main() {
 	flatBet := flag.Float64("flat-bet", 0, "flat bet size for -bot basic (0 = use -min-bet)")
 	noRecords := flag.Bool("no-records", false, "aggregate statistics without storing per-round records (for very large runs)")
 	evRollouts := flag.Int("ev-rollouts", 200, "Monte Carlo rollouts per deviation for the EV-loss metric (0 disables)")
+	stopPolicy := flag.String("stop-policy", "fixed", "session stop policy: fixed (play -games rounds) or model (the model may end the session early)")
+	stopOnlyAhead := flag.Bool("stop-only-ahead", false, "only offer the stop decision while the bankroll is above the starting bankroll")
+	stopMinRounds := flag.Int("stop-min-rounds", 1, "minimum rounds played before the stop decision is offered")
+	stopEvery := flag.Int("stop-every", 1, "offer the stop decision every N rounds")
 
 	decks := flag.Int("decks", 6, "number of decks in the shoe")
 	penetration := flag.Float64("penetration", 0.75, "fraction of the shoe dealt before reshuffling")
@@ -80,6 +84,18 @@ func main() {
 	}
 	if *evRollouts < 0 {
 		fmt.Println("Error: -ev-rollouts must not be negative")
+		os.Exit(1)
+	}
+	if *stopPolicy != "fixed" && *stopPolicy != "model" {
+		fmt.Println("Error: -stop-policy must be 'fixed' or 'model'")
+		os.Exit(1)
+	}
+	if *stopMinRounds < 0 {
+		fmt.Println("Error: -stop-min-rounds must not be negative")
+		os.Exit(1)
+	}
+	if *stopEvery < 1 {
+		fmt.Println("Error: -stop-every must be at least 1")
 		os.Exit(1)
 	}
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
@@ -128,6 +144,9 @@ func main() {
 	if *evRollouts > 0 {
 		game.EnableEV(*evRollouts, rand.New(rand.NewSource(*seed+1)))
 	}
+	if *stopPolicy == "model" {
+		game.EnableStopPolicy(*stopPolicy, *stopOnlyAhead, *stopMinRounds, *stopEvery, *games)
+	}
 
 	fmt.Println("=== Blackjack: player vs Dealer ===")
 	fmt.Printf("Bot:      %s\n", *bot)
@@ -140,6 +159,9 @@ func main() {
 	fmt.Printf("Seed:     %d\n", *seed)
 	fmt.Printf("Fallback: %s\n", *fallback)
 	fmt.Printf("EV:       %d rollouts per deviation\n", *evRollouts)
+	if *stopPolicy == "model" {
+		fmt.Printf("Stop:     model decides every %d round(s), only when ahead %v, min rounds %d\n", *stopEvery, *stopOnlyAhead, *stopMinRounds)
+	}
 	fmt.Printf("Results:  %s\n\n", *results)
 
 	started := time.Now()
@@ -150,6 +172,7 @@ func main() {
 	}
 	ctx := context.Background()
 
+	stopped := false
 	for i := 1; i <= *games && !game.Ruined(); i++ {
 		rec, err := game.PlayRound(ctx)
 		if err != nil {
@@ -163,9 +186,20 @@ func main() {
 		if !*quiet {
 			printRound(rec)
 		}
+		if rec.SessionEnd {
+			stopped = true
+			break
+		}
 		if *delay > 0 && i < *games {
 			time.Sleep(*delay)
 		}
+	}
+
+	stopReason := "rounds"
+	if game.Ruined() {
+		stopReason = "ruined"
+	} else if stopped {
+		stopReason = "model"
 	}
 
 	finished := time.Now()
@@ -174,7 +208,7 @@ func main() {
 	decisions := acc.Decisions()
 
 	report := Report{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Model:         *model,
 		Rules:         rules,
 		Config: RunConfig{
@@ -188,6 +222,10 @@ func main() {
 			ShowCount:     *showCount,
 			Bot:           *bot,
 			EVRollouts:    *evRollouts,
+			StopPolicy:    *stopPolicy,
+			StopOnlyAhead: *stopOnlyAhead,
+			StopMinRounds: *stopMinRounds,
+			StopEvery:     *stopEvery,
 		},
 		StartedAt:  started,
 		FinishedAt: finished,
@@ -200,6 +238,9 @@ func main() {
 			Net:           betting.Profit,
 			FinalBankroll: game.Bankroll(),
 			Ruined:        game.Ruined(),
+			StoppedEarly:  stopReason == "model",
+			StopRound:     game.RoundsPlayed(),
+			StopReason:    stopReason,
 		},
 		Usage:   totalUsage(records),
 		Records: records,
@@ -230,6 +271,8 @@ func printRound(rec RoundRecord) {
 			fmt.Printf("  bet: %s%s\n", d.Action, probLabel(d.Probabilities))
 		case "insurance":
 			fmt.Printf("  insurance: %s\n", d.Action)
+		case "continue":
+			fmt.Printf("  session: %s%s\n", strings.ToUpper(d.Action), probLabel(d.Probabilities))
 		case "action":
 			mark := ""
 			if d.Agrees != nil && !*d.Agrees {
@@ -253,7 +296,7 @@ func probLabel(probs map[string]float64) string {
 	if len(probs) == 0 {
 		return ""
 	}
-	keys := []string{"hit", "stand", "double", "split", "surrender", "bet_5", "bet_10", "bet_50", "all_in"}
+	keys := []string{"hit", "stand", "double", "split", "surrender", "bet_5", "bet_10", "bet_50", "all_in", "stop", "continue"}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		if p, ok := probs[k]; ok {
@@ -325,6 +368,11 @@ func printStats(r Report, started, finished time.Time) {
 
 	if r.Ruined() {
 		fmt.Println("\nThe model went broke: bankroll fell below the minimum bet.")
+	}
+	if r.Summary.StopReason == "model" {
+		fmt.Printf("\nThe model ended the session after round %d with a bankroll of %.2f (%+.2f).\n",
+			r.Summary.StopRound, r.Summary.FinalBankroll, r.Summary.Net)
+		fmt.Println("Note: early-stopped sessions are not comparable to fixed-horizon runs.")
 	}
 }
 

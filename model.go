@@ -134,6 +134,36 @@ func (m *modelDecider) ChooseAction(ctx context.Context, req ActionRequest) Acti
 	return ActionResponse{Action: act, Probabilities: ans.Probabilities, Usage: usage}
 }
 
+func (m *modelDecider) ChooseContinue(ctx context.Context, req ContinueRequest) ContinueResponse {
+	state := fmt.Sprintf(
+		"Blackjack session decision. Rounds played: %d of %d. Bankroll: %.2f units (started at %.2f, profit %+.2f). Peak bankroll: %.2f. Drawdown from peak: %.2f. Lowest bankroll so far: %.2f.\nRules: %s.\n%s%sEach additional round is played at a small disadvantage in expectation, so ending the session now locks in your current bankroll. You are trying to maximize your final bankroll. Should you end the session now?",
+		req.Round, req.TotalRounds, req.Bankroll, req.StartBankroll, req.Profit, req.Peak, req.Drawdown, req.MinBankroll, req.Rules.String(),
+		historyText(req.History), countText(req.ShowCount, req.RunningCount, req.Remaining),
+	)
+
+	questions := map[string]jev.Question{
+		"continue": {
+			Type:         "noul",
+			Instructions: "Should you end the session now?",
+			Criteria: map[string]string{
+				"true":  "End the session now",
+				"false": "Play another round",
+			},
+		},
+	}
+
+	resp, usage, err := m.decide(ctx, jev.DecisionRequest{Model: m.model, State: state, Questions: questions})
+	if err != nil {
+		return ContinueResponse{Continue: true, Usage: usage, Fallback: true, Error: err.Error()}
+	}
+	ans := jev.ParseAnswer(resp.Answers["continue"])
+	if ans.Noul == nil {
+		return ContinueResponse{Continue: true, Usage: usage, Fallback: true, Error: "missing probability"}
+	}
+	stop := *ans.Noul > 0.5
+	return ContinueResponse{Continue: !stop, Stop: stop, Probability: *ans.Noul, Usage: usage}
+}
+
 func (m *modelDecider) ChooseInsurance(ctx context.Context, req InsuranceRequest) InsuranceResponse {
 	state := fmt.Sprintf(
 		"Blackjack insurance decision. The dealer shows an Ace. Bankroll: %.2f units. Your bet: %.2f units. Insurance costs half your bet and pays 2:1 if the dealer has blackjack.",

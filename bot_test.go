@@ -49,6 +49,11 @@ func TestBasicBotBetAndInsurance(t *testing.T) {
 	if ins.Take {
 		t.Fatal("basic strategy never takes insurance")
 	}
+
+	cont := bot.ChooseContinue(context.Background(), ContinueRequest{Round: 50, TotalRounds: 100, Bankroll: 200, StartBankroll: 100, Profit: 100})
+	if !cont.Continue || cont.Stop {
+		t.Fatal("the basic bot never ends the session early")
+	}
 }
 
 func TestBasicBotPlaysRound(t *testing.T) {

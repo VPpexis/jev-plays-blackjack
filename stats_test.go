@@ -151,6 +151,29 @@ func TestEVAccumulation(t *testing.T) {
 	}
 }
 
+func TestDecisionStatsCountContinueKind(t *testing.T) {
+	records := []RoundRecord{
+		{
+			Round:         1,
+			BankrollAfter: 110,
+			SessionEnd:    true,
+			Decisions: []DecisionRecord{
+				{Kind: "continue", Action: "stop", Confidence: 0.8, Probabilities: map[string]float64{"stop": 0.8, "continue": 0.2}},
+			},
+		},
+	}
+	d := aggregateDecisions(records)
+	if d.ByKind["continue"] != 1 {
+		t.Fatalf("continue kind not counted: %+v", d.ByKind)
+	}
+	if d.ByAction["stop"] != 1 {
+		t.Fatalf("stop action not counted: %+v", d.ByAction)
+	}
+	if d.AgreementChecked != 0 || d.BrierN != 0 {
+		t.Fatalf("continue decisions should not affect agreement or brier: %+v", d)
+	}
+}
+
 func TestAccumulatorMatchesAggregates(t *testing.T) {
 	records := sampleRecords()
 	p1, d1 := aggregateSides(records)

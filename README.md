@@ -13,6 +13,9 @@ The model is asked three kinds of questions through the Decisions API:
 - **Action**: what to do with the hand (hit, stand, double, split or surrender).
 - **Insurance**: whether to take insurance when the dealer shows an ace (optional, off by default).
 
+With `-stop-policy model` it is also asked, after each round, whether to **continue or end the
+session** — see [Session stop policy](#session-stop-policy).
+
 Every decision, its probabilities, the resulting cards, and the bankroll outcome are recorded
 to a JSON report with full statistics.
 
@@ -24,6 +27,9 @@ to a JSON report with full statistics.
   configurable blackjack payout, double (any two / 9–11 / off), double after split, splits to
   N hands, split aces, late surrender, and insurance.
 - **Money management**: the model bets a percentage of its bankroll each round and can go broke.
+- **Session control**: with `-stop-policy model` the model decides after each round whether to keep
+  playing or cash out, with profit, round-count and frequency gates and the reason recorded in the
+  report.
 - **Basic-strategy benchmark**: a built-in chart drives the fallback on API failure and measures
   how often the model agrees with optimal play.
 - **Statistics**: per-side win/loss/push, blackjack and bust rates, total distributions, win rate
@@ -139,6 +145,27 @@ Split aces always receive one card and cannot be resplit.
 | `-fallback` | `basic` | What to play when the API fails or returns an invalid action: `basic` uses the basic-strategy chart, `stand` always stands. Bet fallbacks always use `bet_5`. |
 | `-show-count` | `false` | Include the Hi-Lo running count and remaining shoe composition in prompts. |
 
+### Session stop policy
+
+| Flag | Default | Description |
+|---|---|---|
+| `-stop-policy` | `fixed` | `fixed` plays `-games` rounds (or until ruin). `model` lets the model end the session early after any completed round. |
+| `-stop-only-ahead` | `false` | Only offer the stop decision while the bankroll is above the starting bankroll. |
+| `-stop-min-rounds` | `1` | Minimum rounds played before the stop decision is offered. |
+| `-stop-every` | `1` | Offer the stop decision every N rounds. |
+
+With `-stop-policy model` each completed round is followed by an extra Decisions API call asking
+the model whether to end the session, given the rounds played, bankroll, profit, peak, drawdown and
+the last few results. If it stops, the run ends and the report records
+`stopped_early`/`stop_round`/`stop_reason: "model"`. An API error always resolves to *continue*, so
+a network blip can never end a session.
+
+Note that stopping early cannot change the expected value of the game — it only reshapes the
+distribution of outcomes. A stop rule that quits while ahead produces many small winning sessions
+and rare large losses, so the headline profit and win rate of an early-stopped run are **not
+comparable** to a fixed-horizon run; compare the per-wager house edge and the EV-loss metric
+instead. See `stop_reason` in the report for how a run ended.
+
 ### Output
 
 | Flag | Default | Description |
@@ -164,6 +191,12 @@ go run . -games 100 -fallback stand
 
 # Free engine validation: a million hands with the basic-strategy bot
 go run . -bot basic -games 1000000 -no-records -quiet -flat-bet 1 -bankroll 10000000
+
+# Let the model decide when to end the session, asking every 5 rounds
+go run . -games 200 -stop-policy model -stop-every 5
+
+# Same, but the model is only asked while it is ahead of its starting bankroll
+go run . -games 200 -stop-policy model -stop-only-ahead
 ```
 
 ---
@@ -271,34 +304,43 @@ The end-of-run summary and report include:
 
 ## Results report
 
-`blackjack_results.json` uses schema version 2. Top-level fields:
+`blackjack_results.json` uses schema version 3. Top-level fields:
 
 | Field | Description |
 |---|---|
-| `schema_version` | Always `2`. |
+| `schema_version` | Always `3`. |
 | `model` | Model that played. |
 | `rules` | Full rule set used for the run. |
-| `config` | Games requested, rounds played, seed, bankroll settings, fallback, bot, EV rollouts and count flags. |
+| `config` | Games requested, rounds played, seed, bankroll settings, fallback, bot, EV rollouts, stop policy and count flags. |
 | `started_at` / `finished_at` | Run timestamps. |
 | `player`, `dealer` | Aggregated side statistics. |
 | `betting` | Bankroll and betting statistics. |
 | `decisions` | Decision quality statistics. |
-| `summary` | Rounds, net, final bankroll, ruined. |
+| `summary` | Rounds, net, final bankroll, ruined, and how the run ended. |
 | `usage` | Totals for calls, tokens, cost and latency. |
 | `records` | One entry per round. |
 
+`summary` includes `stopped_early`, `stop_round` and `stop_reason`. `stop_reason` is one of:
+
+| Value | Meaning |
+|---|---|
+| `model` | The model chose to end the session early. |
+| `ruined` | The bankroll fell below the minimum bet. |
+| `rounds` | The full `-games` count was played. |
+
 Each round record contains the bet option and amount, bankroll before/after, the final hands, the
 dealer cards and total, insurance bet, net result and round outcome, every decision made, the shoe
-position and the running count.
+position, the running count and a `session_end` flag when the model stopped after that round.
 
 Each hand record contains the cards, total, soft flag, bet and total wagered, whether it was
 doubled, split or surrendered, whether it was a natural blackjack or a bust, its outcome, payout
 and net.
 
-Each decision record contains its kind (`bet`, `action` or `insurance`), the hand and dealer
-context, the legal actions, the chosen action and probabilities, confidence, the basic-strategy
-action and whether the model agreed with it, the estimated EV lost to a deviation (when checked),
-fallback and error flags, latency and token usage.
+Each decision record contains its kind (`bet`, `action`, `insurance` or `continue`), the hand and
+dealer context, the legal actions, the chosen action and probabilities, confidence, the
+basic-strategy action and whether the model agreed with it, the estimated EV lost to a deviation
+(when checked), fallback and error flags, latency and token usage. A `continue` record has the
+action `continue` or `stop` and carries both probabilities.
 
 ---
 
@@ -339,8 +381,8 @@ gofmt -l .         # formatting check
 
 The tests cover hand totals, shoe penetration and composition, the basic-strategy chart, payout
 math and payout invariants, bet sizing, legal-action rules, bankroll conservation, ruin, split
-flow, the basic-strategy bot, EV simulation, streaming-accumulator equivalence, the mocked model
-end-to-end path, fallback behaviour and statistics aggregation.
+flow, the session stop policy, the basic-strategy bot, EV simulation, streaming-accumulator
+equivalence, the mocked model end-to-end path, fallback behaviour and statistics aggregation.
 
 ## Decisions API demo
 
@@ -360,6 +402,9 @@ that is a few hundred API calls, a few cents of usage, and a few minutes of wall
 roughly 0.8 seconds per call. Use `-quiet` for long runs and `-seed` when you need to reproduce a
 particular shoe.
 
+`-stop-policy model` adds one call per round (or one per `-stop-every` rounds), so it increases the
+cost of a run by roughly 30% at the default settings.
+
 ## Notes and limitations
 
 - The model cannot split, double or surrender unless the rules and bankroll allow it, and it is
@@ -372,3 +417,6 @@ particular shoe.
   recent-results summary included in the prompt.
 - The EV-loss metric samples the dealer's hole card from the remaining shoe, so it measures the
   expected value of an action at the moment of the decision rather than in hindsight.
+- The session stop decision is optional stopping: it cannot make a negative-edge game positive, it
+  only changes the distribution of outcomes. Treat early-stopped runs as session-management
+  experiments, not as edge measurements.

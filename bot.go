@@ -30,3 +30,7 @@ func (b *basicBot) ChooseAction(ctx context.Context, req ActionRequest) ActionRe
 func (b *basicBot) ChooseInsurance(ctx context.Context, req InsuranceRequest) InsuranceResponse {
 	return InsuranceResponse{Take: false}
 }
+
+func (b *basicBot) ChooseContinue(ctx context.Context, req ContinueRequest) ContinueResponse {
+	return ContinueResponse{Continue: true}
+}
