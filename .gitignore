@@ -1,0 +1,6 @@
+.env
+*.exe
+blackjack_results.json
+response_output.txt
+response_output.json
+jev_decision.json
