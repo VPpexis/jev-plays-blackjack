@@ -37,6 +37,8 @@ type DecisionRecord struct {
 	Confidence    float64            `json:"confidence,omitempty"`
 	BasicAction   string             `json:"basic_action,omitempty"`
 	Agrees        *bool              `json:"agrees,omitempty"`
+	EVLoss        float64            `json:"ev_loss,omitempty"`
+	EVChecked     bool               `json:"ev_checked,omitempty"`
 	Fallback      bool               `json:"fallback,omitempty"`
 	Error         string             `json:"error,omitempty"`
 	LatencyMs     int64              `json:"latency_ms,omitempty"`
@@ -111,6 +113,7 @@ type BetRequest struct {
 
 type BetResponse struct {
 	Option        string
+	Flat          float64
 	Probabilities map[string]float64
 	Usage         CallUsage
 	Fallback      bool
@@ -186,6 +189,7 @@ type Game struct {
 	minBet        float64
 	unit          float64
 	decider       Decider
+	ev            *evEstimator
 	round         int
 	history       []RoundSummary
 	showCount     bool
@@ -215,6 +219,12 @@ func (g *Game) Ruined() bool         { return g.ruined }
 func (g *Game) RoundsPlayed() int    { return g.round }
 func (g *Game) MaxDrawdown() float64 { return g.maxDD }
 
+func (g *Game) EnableEV(rollouts int, rng *rand.Rand) {
+	if rollouts > 0 {
+		g.ev = &evEstimator{rules: g.rules, rng: rng, rollouts: rollouts}
+	}
+}
+
 func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 	if g.ruined {
 		return RoundRecord{}, fmt.Errorf("bankroll %.2f is below the minimum bet %.2f", g.bankroll, g.minBet)
@@ -232,7 +242,7 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 
 	betResp := g.decider.ChooseBet(ctx, g.betRequest())
 	rec.BetOption = betResp.Option
-	rec.Bet = g.betAmount(betResp.Option)
+	rec.Bet = g.betAmount(betResp)
 	rec.Decisions = append(rec.Decisions, betDecisionRecord(g.round, betResp))
 	g.bankroll -= rec.Bet
 
@@ -253,7 +263,7 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 
 	hands := []*playerHand{player}
 
-	if !player.natural() {
+	if !player.natural() && !(g.rules.DealerPeeks && dealer.Blackjack()) {
 		for i := 0; i < len(hands); i++ {
 			h := hands[i]
 			if h.done {
@@ -279,7 +289,8 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 					act = ActionStand
 					resp.Action = act
 				}
-				rec.Decisions = append(rec.Decisions, actionDecisionRecord(g.round, i, h, dealer[0], legal, resp, g.rules))
+				evLoss, evChecked := g.evLoss(h.cards, dealer[0], legal, resp.Action)
+				rec.Decisions = append(rec.Decisions, actionDecisionRecord(g.round, i, h, dealer[0], legal, resp, g.rules, evLoss, evChecked))
 
 				switch act {
 				case ActionHit:
@@ -292,6 +303,7 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 				case ActionDouble:
 					g.bankroll -= h.bet
 					h.wagered += h.bet
+					h.bet = h.wagered
 					h.doubled = true
 					h.cards = append(h.cards, g.shoe.Draw())
 					h.done = true
@@ -359,9 +371,22 @@ func (g *Game) PlayRound(ctx context.Context) (RoundRecord, error) {
 	return rec, nil
 }
 
-func (g *Game) betAmount(option string) float64 {
+func (g *Game) betAmount(resp BetResponse) float64 {
+	if resp.Flat > 0 || resp.Option == "flat" {
+		amount := resp.Flat
+		if amount <= 0 {
+			amount = g.minBet
+		}
+		if amount > g.bankroll {
+			amount = g.bankroll
+		}
+		if amount < g.minBet {
+			amount = math.Min(g.minBet, g.bankroll)
+		}
+		return amount
+	}
 	pct := 0.05
-	switch option {
+	switch resp.Option {
 	case "bet_10":
 		pct = 0.10
 	case "bet_50":
@@ -370,7 +395,7 @@ func (g *Game) betAmount(option string) float64 {
 		pct = 1.0
 	}
 	amount := math.Floor(g.bankroll*pct/g.unit) * g.unit
-	if option == "all_in" {
+	if resp.Option == "all_in" {
 		amount = g.bankroll
 	}
 	if amount < g.minBet {
@@ -442,6 +467,23 @@ func (g *Game) legalActions(h *playerHand, hands []*playerHand, dealer Hand) []A
 		legal = append(legal, ActionSurrender)
 	}
 	return legal
+}
+
+func (g *Game) evLoss(hand Hand, up Card, legal []Action, chosen Action) (float64, bool) {
+	if g.ev == nil {
+		return 0, false
+	}
+	basic := BasicStrategy(g.rules, hand, up, containsAction(legal, ActionDouble), containsAction(legal, ActionSplit))
+	if basic == chosen {
+		return 0, false
+	}
+	remaining := g.shoe.RemainingCards()
+	basicEV := g.ev.estimate(hand, up, remaining, basic)
+	chosenEV := g.ev.estimate(hand, up, remaining, chosen)
+	if math.IsNaN(basicEV) || math.IsNaN(chosenEV) {
+		return 0, false
+	}
+	return basicEV - chosenEV, true
 }
 
 func (g *Game) updateRisk() {
@@ -574,7 +616,7 @@ func betDecisionRecord(round int, resp BetResponse) DecisionRecord {
 	return d
 }
 
-func actionDecisionRecord(round, index int, h *playerHand, up Card, legal []Action, resp ActionResponse, r Rules) DecisionRecord {
+func actionDecisionRecord(round, index int, h *playerHand, up Card, legal []Action, resp ActionResponse, r Rules, evLoss float64, evChecked bool) DecisionRecord {
 	legalStrs := make([]string, len(legal))
 	for i, a := range legal {
 		legalStrs[i] = string(a)
@@ -594,6 +636,8 @@ func actionDecisionRecord(round, index int, h *playerHand, up Card, legal []Acti
 		Probabilities: resp.Probabilities,
 		BasicAction:   string(basic),
 		Agrees:        &agree,
+		EVLoss:        evLoss,
+		EVChecked:     evChecked,
 		Fallback:      resp.Fallback,
 		Error:         resp.Error,
 		LatencyMs:     resp.Usage.LatencyMs,

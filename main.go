@@ -33,12 +33,6 @@ func envInt(key string, def int) int {
 func main() {
 	_ = godotenv.Load()
 
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		fmt.Println("Error: OPENROUTER_API_KEY is not set in .env or system environment.")
-		os.Exit(1)
-	}
-
 	model := flag.String("model", defaultModel, "Jev model to use")
 	games := flag.Int("games", envInt("BLACKJACK_GAMES", 100), "number of rounds to play (env: BLACKJACK_GAMES)")
 	seed := flag.Int64("seed", time.Now().UnixNano(), "random seed for the shoe")
@@ -46,11 +40,16 @@ func main() {
 	timeout := flag.Duration("timeout", 60*time.Second, "per-decision API timeout")
 	delay := flag.Duration("delay", 0, "delay between rounds")
 	quiet := flag.Bool("quiet", false, "suppress per-round console output")
+	bot := flag.String("bot", "model", "who plays: model (Jev via API) or basic (local basic-strategy bot)")
+	flatBet := flag.Float64("flat-bet", 0, "flat bet size for -bot basic (0 = use -min-bet)")
+	noRecords := flag.Bool("no-records", false, "aggregate statistics without storing per-round records (for very large runs)")
+	evRollouts := flag.Int("ev-rollouts", 200, "Monte Carlo rollouts per deviation for the EV-loss metric (0 disables)")
 
 	decks := flag.Int("decks", 6, "number of decks in the shoe")
 	penetration := flag.Float64("penetration", 0.75, "fraction of the shoe dealt before reshuffling")
 	bjpay := flag.String("bjpay", "3:2", "blackjack payout: 3:2, 6:5 or 1:1")
 	h17 := flag.Bool("h17", false, "dealer hits soft 17")
+	peek := flag.Bool("peek", true, "dealer peeks for blackjack on ace or 10 up (US rules; disable for ENHC)")
 	double := flag.Bool("double", true, "allow doubling down")
 	doubleAny := flag.Bool("double-any", true, "allow doubling on any two cards (false: only on 9-11)")
 	das := flag.Bool("das", true, "allow double after split")
@@ -75,6 +74,19 @@ func main() {
 		fmt.Println("Error: -games must be at least 1")
 		os.Exit(1)
 	}
+	if *bot != "model" && *bot != "basic" {
+		fmt.Println("Error: -bot must be 'model' or 'basic'")
+		os.Exit(1)
+	}
+	if *evRollouts < 0 {
+		fmt.Println("Error: -ev-rollouts must not be negative")
+		os.Exit(1)
+	}
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if *bot == "model" && apiKey == "" {
+		fmt.Println("Error: OPENROUTER_API_KEY is not set in .env or system environment.")
+		os.Exit(1)
+	}
 	if *fallback != "basic" && *fallback != "stand" {
 		fmt.Println("Error: -fallback must be 'basic' or 'stand'")
 		os.Exit(1)
@@ -89,6 +101,7 @@ func main() {
 		Penetration:      *penetration,
 		BlackjackPays:    payout,
 		DealerHitsSoft17: *h17,
+		DealerPeeks:      *peek,
 		DoubleAllowed:    *double,
 		DoubleAnyTwo:     *doubleAny,
 		DoubleAfterSplit: *das,
@@ -104,21 +117,37 @@ func main() {
 	}
 
 	rng := rand.New(rand.NewSource(*seed))
-	client := jev.NewClient(apiKey)
-	decider := NewModelDecider(client, *model, rules, *timeout, *fallback, *showCount, *games)
+	var decider Decider
+	if *bot == "basic" {
+		decider = NewBasicBot(rules, *flatBet)
+	} else {
+		client := jev.NewClient(apiKey)
+		decider = NewModelDecider(client, *model, rules, *timeout, *fallback, *showCount, *games)
+	}
 	game := NewGame(rules, *startBankroll, *minBet, *unit, decider, rng, *showCount)
+	if *evRollouts > 0 {
+		game.EnableEV(*evRollouts, rand.New(rand.NewSource(*seed+1)))
+	}
 
-	fmt.Println("=== Blackjack: Jev model vs Dealer ===")
-	fmt.Printf("Model:    %s\n", *model)
+	fmt.Println("=== Blackjack: player vs Dealer ===")
+	fmt.Printf("Bot:      %s\n", *bot)
+	if *bot == "model" {
+		fmt.Printf("Model:    %s\n", *model)
+	}
 	fmt.Printf("Rules:    %s\n", rules.String())
 	fmt.Printf("Bankroll: %.2f units (min bet %.2f, unit %.2f)\n", *startBankroll, *minBet, *unit)
 	fmt.Printf("Rounds:   %d\n", *games)
 	fmt.Printf("Seed:     %d\n", *seed)
 	fmt.Printf("Fallback: %s\n", *fallback)
+	fmt.Printf("EV:       %d rollouts per deviation\n", *evRollouts)
 	fmt.Printf("Results:  %s\n\n", *results)
 
 	started := time.Now()
-	records := make([]RoundRecord, 0, *games)
+	acc := NewAccumulator(*startBankroll)
+	var records []RoundRecord
+	if !*noRecords {
+		records = make([]RoundRecord, 0, min(*games, 100000))
+	}
 	ctx := context.Background()
 
 	for i := 1; i <= *games && !game.Ruined(); i++ {
@@ -127,7 +156,10 @@ func main() {
 			fmt.Printf("Round %d aborted: %v\n", i, err)
 			break
 		}
-		records = append(records, rec)
+		acc.Add(rec)
+		if !*noRecords {
+			records = append(records, rec)
+		}
 		if !*quiet {
 			printRound(rec)
 		}
@@ -137,9 +169,9 @@ func main() {
 	}
 
 	finished := time.Now()
-	player, dealer := aggregateSides(records)
-	betting := aggregateBetting(records, *startBankroll, game.Ruined())
-	decisions := aggregateDecisions(records)
+	player, dealer := acc.Player(), acc.Dealer()
+	betting := acc.Betting(game.Ruined())
+	decisions := acc.Decisions()
 
 	report := Report{
 		SchemaVersion: 2,
@@ -147,13 +179,15 @@ func main() {
 		Rules:         rules,
 		Config: RunConfig{
 			Games:         *games,
-			RoundsPlayed:  len(records),
+			RoundsPlayed:  game.RoundsPlayed(),
 			Seed:          *seed,
 			StartBankroll: *startBankroll,
 			Unit:          *unit,
 			MinBet:        *minBet,
 			Fallback:      *fallback,
 			ShowCount:     *showCount,
+			Bot:           *bot,
+			EVRollouts:    *evRollouts,
 		},
 		StartedAt:  started,
 		FinishedAt: finished,
@@ -162,7 +196,7 @@ func main() {
 		Betting:    betting,
 		Decisions:  decisions,
 		Summary: Summary{
-			Rounds:        len(records),
+			Rounds:        game.RoundsPlayed(),
 			Net:           betting.Profit,
 			FinalBankroll: game.Bankroll(),
 			Ruined:        game.Ruined(),
@@ -263,8 +297,8 @@ func printStats(r Report, started, finished time.Time) {
 		d.Hands, pct(d.Wins, d.Hands), pct(d.Losses, d.Hands), pct(d.Pushes, d.Hands), pct(d.Blackjacks, d.Hands), pct(d.Busts, d.Hands), d.AvgTotal, d.MinTotal, d.MaxTotal)
 
 	fmt.Println("\n=== Bankroll ===")
-	fmt.Printf("Start %.2f -> End %.2f | profit %+.2f | wagered %.2f | RTP %.2f%% | house edge %.2f%% (95%% CI %.2f%%..%.2f%%)\n",
-		b.StartBankroll, b.EndBankroll, b.Profit, b.TotalWagered, b.RTP*100, b.HouseEdge*100, b.EdgeCI95[0]*100, b.EdgeCI95[1]*100)
+	fmt.Printf("Start %.2f -> End %.2f | profit %+.2f | wagered %.2f | RTP %.2f%% | house edge %.2f%% (95%% CI %.2f%%..%.2f%%, n_eff %.1f)\n",
+		b.StartBankroll, b.EndBankroll, b.Profit, b.TotalWagered, b.RTP*100, b.HouseEdge*100, b.EdgeCI95[0]*100, b.EdgeCI95[1]*100, b.EdgeN)
 	fmt.Printf("Avg bet %.2f | peak %.2f | low %.2f | max drawdown %.2f | ruined %v | rounds %d\n",
 		b.AvgBet, b.PeakBankroll, b.MinBankroll, b.MaxDrawdown, b.Ruined, b.Rounds)
 	fmt.Printf("Bet mix: bet_5 %d, bet_10 %d, bet_50 %d, all_in %d\n",
@@ -280,6 +314,10 @@ func printStats(r Report, started, finished time.Time) {
 		dec.Total, dec.ByAction["hit"], dec.ByAction["stand"], dec.ByAction["double"], dec.ByAction["split"], dec.ByAction["surrender"], dec.Fallbacks, dec.Errors)
 	fmt.Printf("Avg confidence %.3f | Brier %.3f (n=%d) | basic-strategy agreement %.1f%% (%d/%d) | avg latency %.0f ms\n",
 		dec.AvgConfidence, dec.BrierScore, dec.BrierN, dec.AgreementRate*100, dec.AgreementCount, dec.AgreementChecked, dec.AvgLatencyMs)
+	if dec.EVChecked > 0 {
+		fmt.Printf("EV lost to deviations: %.4f units over %d checked decisions (%.4f per decision)\n",
+			dec.EVLossTotal, dec.EVChecked, dec.EVLossPerChecked)
+	}
 
 	fmt.Println("\n=== Usage ===")
 	fmt.Printf("API calls %d | input tokens %d | output tokens %d | cost $%.6f | avg latency %.0f ms | wall time %s\n",

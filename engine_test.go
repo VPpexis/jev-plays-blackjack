@@ -101,18 +101,29 @@ func TestBetAmount(t *testing.T) {
 	g := &Game{bankroll: 100, unit: 1, minBet: 1}
 	cases := map[string]float64{"bet_5": 5, "bet_10": 10, "bet_50": 50, "all_in": 100}
 	for opt, want := range cases {
-		if got := g.betAmount(opt); got != want {
+		if got := g.betAmount(BetResponse{Option: opt}); got != want {
 			t.Errorf("%s: got %v want %v", opt, got, want)
 		}
 	}
 
 	small := &Game{bankroll: 7, unit: 1, minBet: 1}
-	if got := small.betAmount("bet_5"); got != 1 {
+	if got := small.betAmount(BetResponse{Option: "bet_5"}); got != 1 {
 		t.Errorf("5%% of 7 floored to 0 should clamp to min bet 1, got %v", got)
 	}
 	odd := &Game{bankroll: 7, unit: 5, minBet: 5}
-	if got := odd.betAmount("bet_10"); got != 5 {
+	if got := odd.betAmount(BetResponse{Option: "bet_10"}); got != 5 {
 		t.Errorf("10%% of 7 with unit 5 should clamp to 5, got %v", got)
+	}
+	flat := &Game{bankroll: 100, unit: 1, minBet: 10}
+	if got := flat.betAmount(BetResponse{Option: "flat", Flat: 25}); got != 25 {
+		t.Errorf("flat bet should be 25, got %v", got)
+	}
+	if got := flat.betAmount(BetResponse{Option: "flat"}); got != 10 {
+		t.Errorf("flat bet without size should use min bet 10, got %v", got)
+	}
+	poor := &Game{bankroll: 3, unit: 1, minBet: 10}
+	if got := poor.betAmount(BetResponse{Option: "flat", Flat: 25}); got != 3 {
+		t.Errorf("flat bet should clamp to bankroll 3, got %v", got)
 	}
 }
 
@@ -229,6 +240,52 @@ func TestSplitForced(t *testing.T) {
 	}
 	if !sawSplit {
 		t.Skip("no split opportunity occurred in 200 rounds")
+	}
+}
+
+func TestPayoutInvariants(t *testing.T) {
+	rules := baseRules()
+	actions := make([]Action, 400)
+	for i := range actions {
+		actions[i] = ActionDouble
+	}
+	dec := &scriptDecider{bets: []string{"bet_5"}, actions: actions}
+	game := NewGame(rules, 100000, 1, 1, dec, rand.New(rand.NewSource(21)), false)
+
+	doubled := 0
+	for i := 0; i < 200; i++ {
+		rec, err := game.PlayRound(context.Background())
+		if err != nil {
+			t.Fatalf("round %d: %v", i, err)
+		}
+		for _, h := range rec.Hands {
+			if h.Doubled {
+				doubled++
+			}
+			var multiplier float64
+			switch h.Outcome {
+			case "WIN":
+				if h.Blackjack {
+					multiplier = 2.5
+				} else {
+					multiplier = 2
+				}
+			case "PUSH":
+				multiplier = 1
+			case "SURRENDER":
+				multiplier = 0.5
+			case "LOSS":
+				multiplier = 0
+			}
+			want := multiplier * h.Wagered
+			if math.Abs(h.Payout-want) > 1e-9 {
+				t.Fatalf("round %d hand %v: outcome %s payout %v want %v (bet %v wagered %v doubled %v)",
+					i, h.Cards, h.Outcome, h.Payout, want, h.Bet, h.Wagered, h.Doubled)
+			}
+		}
+	}
+	if doubled == 0 {
+		t.Skip("no doubles occurred")
 	}
 }
 

@@ -91,11 +91,20 @@ Round 1 | bet 10.00 (bet_10) | bankroll 100.00 -> 110.00
 | Flag | Default | Description |
 |---|---|---|
 | `-model` | `~typesafe/jev-latest` | Jev model that plays the game. |
+| `-bot` | `model` | Who plays: `model` (Jev via the API) or `basic` (local basic-strategy bot, no API calls). |
 | `-games` | `100` (env `BLACKJACK_GAMES`) | Number of rounds to play. Stops early if the bankroll is exhausted. |
 | `-seed` | current time | RNG seed for the shoe; the same seed reproduces the same shoe. |
 | `-timeout` | `1m0s` | Timeout per API attempt. Each decision retries up to three times with backoff. |
 | `-delay` | `0` | Pause between rounds (for example `500ms` or `2s`). |
 | `-results` | `blackjack_results.json` | Path of the JSON report. |
+| `-no-records` | `false` | Aggregate statistics without storing per-round records, for very large runs. |
+| `-ev-rollouts` | `200` | Monte Carlo rollouts per deviation for the EV-loss metric; `0` disables it. |
+
+### Bot
+
+| Flag | Default | Description |
+|---|---|---|
+| `-flat-bet` | `0` | Flat bet size for `-bot basic`; `0` uses `-min-bet`. |
 
 ### Rules
 
@@ -105,6 +114,7 @@ Round 1 | bet 10.00 (bet_10) | bankroll 100.00 -> 110.00
 | `-penetration` | `0.75` | Fraction of the shoe dealt before reshuffling; reshuffles happen between rounds. |
 | `-bjpay` | `3:2` | Blackjack payout: `3:2`, `6:5` or `1:1`. |
 | `-h17` | `false` | Dealer hits soft 17. Default is S17 (dealer stands on soft 17). |
+| `-peek` | `true` | Dealer peeks for blackjack on an ace or 10 up-card. Disable for European no-hole-card rules. |
 | `-double` | `true` | Allow doubling down. |
 | `-double-any` | `true` | Allow doubling on any two cards; `false` restricts doubling to hard 9–11. |
 | `-das` | `true` | Allow double after split. |
@@ -151,6 +161,9 @@ go run . -games 500 -bankroll 1000 -unit 5 -show-count -quiet
 
 # Conservative model with a stand-only fallback
 go run . -games 100 -fallback stand
+
+# Free engine validation: a million hands with the basic-strategy bot
+go run . -bot basic -games 1000000 -no-records -quiet -flat-bet 1 -bankroll 10000000
 ```
 
 ---
@@ -210,6 +223,33 @@ added. The stated objective is to maximise the final bankroll.
 
 ---
 
+## Engine validation
+
+`-bot basic` swaps the API model for a local basic-strategy bot. No network, no tokens, no cost,
+so you can play millions of hands and measure the engine's own house edge:
+
+```bash
+go run . -bot basic -games 1000000 -no-records -quiet -flat-bet 1 -bankroll 10000000
+```
+
+Reference result for the default rules (6 decks, S17, 3:2, DAS, dealer peek, split to 4 hands):
+
+| Metric | Measured (1M hands) | Published benchmark |
+|---|---|---|
+| House edge | **0.50%** (95% CI 0.30%–0.71%) | ~0.43–0.46% |
+| Player win / loss / push | 43.5% / 48.0% / 8.6% | ~42.4% / ~49.1% / ~8.5% |
+| Player blackjack | 4.6% | ~4.75% |
+| Dealer bust (rounds where it plays) | ~29% | ~28% |
+
+A million hands takes about 15 seconds and produces a confidence interval of roughly ±0.2%;
+ten million narrows it to about ±0.07%. Use `-no-records` so the report stays small.
+
+`TestChartAudit` audits the strategy chart itself: for every hard, soft and pair hand against every
+up-card it uses the rollout simulator to compare the chart's action with the best legal action, and
+fails if any cell is materially suboptimal.
+
+---
+
 ## Metrics
 
 The end-of-run summary and report include:
@@ -217,10 +257,14 @@ The end-of-run summary and report include:
 - **Player vs dealer**: hands, win/loss/push rates, blackjack and bust rates, average/min/max final
   totals and the full distribution of final totals.
 - **Bankroll**: starting and ending bankroll, profit, total wagered, RTP, house edge with standard
-  error and 95% confidence interval, average bet, peak, low, maximum drawdown and ruin flag.
+  error and 95% confidence interval, effective sample size, average bet, peak, low, maximum
+  drawdown and ruin flag.
 - **Betting mix**: rounds, profit and win rate for each bet option, including all-in rounds.
 - **Decisions**: counts by kind and action, fallbacks, errors, average confidence, Brier score
   (calibration against basic strategy), basic-strategy agreement rate and average latency.
+- **EV lost to deviations**: when a decision differs from basic strategy, the engine estimates the
+  expected value of both actions with a Monte Carlo rollout over the remaining shoe and records the
+  difference. Only deviating decisions are simulated, so it is cheap even at 200 rollouts.
 - **Usage**: API calls, input/output tokens, cost and wall-clock time.
 
 ---
@@ -234,7 +278,7 @@ The end-of-run summary and report include:
 | `schema_version` | Always `2`. |
 | `model` | Model that played. |
 | `rules` | Full rule set used for the run. |
-| `config` | Games requested, rounds played, seed, bankroll settings, fallback and count flags. |
+| `config` | Games requested, rounds played, seed, bankroll settings, fallback, bot, EV rollouts and count flags. |
 | `started_at` / `finished_at` | Run timestamps. |
 | `player`, `dealer` | Aggregated side statistics. |
 | `betting` | Bankroll and betting statistics. |
@@ -253,7 +297,8 @@ and net.
 
 Each decision record contains its kind (`bet`, `action` or `insurance`), the hand and dealer
 context, the legal actions, the chosen action and probabilities, confidence, the basic-strategy
-action and whether the model agreed with it, fallback and error flags, latency and token usage.
+action and whether the model agreed with it, the estimated EV lost to a deviation (when checked),
+fallback and error flags, latency and token usage.
 
 ---
 
@@ -266,8 +311,10 @@ action and whether the model agreed with it, fallback and error flags, latency a
 ├── rules.go           Rules, validation and the basic-strategy chart
 ├── engine.go          Round state machine, legal actions, splits, payouts, bankroll
 ├── model.go           Prompt building, Decisions API calls, retries and fallback
-├── stats.go           Aggregation into player/dealer/betting/decision statistics
-├── *_test.go          Unit tests for every module
+├── bot.go             Local basic-strategy bot used for free engine validation
+├── ev.go              Monte Carlo rollout simulator for EV-loss estimation
+├── stats.go           Streaming accumulators for player/dealer/betting/decision statistics
+├── *_test.go          Unit tests, including the strategy-chart audit
 ├── jev/
 │   └── client.go      Reusable OpenRouter Decisions API client and answer parsing
 ├── cmd/
@@ -286,11 +333,13 @@ action and whether the model agreed with it, fallback and error flags, latency a
 go build ./...     # build everything
 go vet ./...       # static checks
 go test ./...      # unit tests (no API calls; the model is mocked with httptest)
+go test -short ./...  # skips the slower strategy-chart audit
 gofmt -l .         # formatting check
 ```
 
 The tests cover hand totals, shoe penetration and composition, the basic-strategy chart, payout
-math, bet sizing, legal-action rules, bankroll conservation, ruin, split flow, the mocked model
+math and payout invariants, bet sizing, legal-action rules, bankroll conservation, ruin, split
+flow, the basic-strategy bot, EV simulation, streaming-accumulator equivalence, the mocked model
 end-to-end path, fallback behaviour and statistics aggregation.
 
 ## Decisions API demo
@@ -315,7 +364,11 @@ particular shoe.
 
 - The model cannot split, double or surrender unless the rules and bankroll allow it, and it is
   never shown an illegal option.
+- With `-peek` (the default) the dealer checks for blackjack on an ace or 10 up-card, so the player
+  never doubles or splits into a dealer natural. Disable it for European no-hole-card rules.
 - The basic-strategy chart assumes a multi-deck game; single-deck play with `-decks 1` uses the
   same chart and will differ slightly from composition-dependent optimal play.
 - All decisions are independent API calls; the model has no memory between rounds other than the
   recent-results summary included in the prompt.
+- The EV-loss metric samples the dealer's hole card from the remaining shoe, so it measures the
+  expected value of an action at the moment of the decision rather than in hindsight.

@@ -17,6 +17,7 @@ type Rules struct {
 	Penetration      float64 `json:"penetration"`
 	BlackjackPays    float64 `json:"blackjack_pays"`
 	DealerHitsSoft17 bool    `json:"dealer_hits_soft_17"`
+	DealerPeeks      bool    `json:"dealer_peeks"`
 	DoubleAllowed    bool    `json:"double_allowed"`
 	DoubleAnyTwo     bool    `json:"double_any_two"`
 	DoubleAfterSplit bool    `json:"double_after_split"`
@@ -50,7 +51,11 @@ func (r Rules) String() string {
 	if !r.DoubleAfterSplit {
 		das = "no double after split"
 	}
-	return fmt.Sprintf("%d-deck shoe, dealer %s, blackjack pays %s, %s, %s, up to %d hands after splits", r.Decks, dealer, pay, dbl, das, r.MaxHands)
+	peek := "dealer peeks for blackjack"
+	if !r.DealerPeeks {
+		peek = "no dealer peek"
+	}
+	return fmt.Sprintf("%d-deck shoe, dealer %s, blackjack pays %s, %s, %s, %s, up to %d hands after splits", r.Decks, dealer, pay, dbl, das, peek, r.MaxHands)
 }
 
 func (r Rules) Validate() error {

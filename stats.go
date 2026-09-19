@@ -31,6 +31,7 @@ type BettingStats struct {
 	HouseEdge       float64            `json:"house_edge"`
 	EdgeStdErr      float64            `json:"edge_std_err"`
 	EdgeCI95        [2]float64         `json:"edge_ci95"`
+	EdgeN           float64            `json:"edge_effective_n"`
 	AvgBet          float64            `json:"avg_bet"`
 	AvgBetPct       float64            `json:"avg_bet_pct"`
 	MaxDrawdown     float64            `json:"max_drawdown"`
@@ -57,6 +58,9 @@ type DecisionStats struct {
 	AgreementCount   int            `json:"agreement_count"`
 	AgreementRate    float64        `json:"agreement_rate"`
 	AvgLatencyMs     float64        `json:"avg_latency_ms"`
+	EVChecked        int            `json:"ev_checked"`
+	EVLossTotal      float64        `json:"ev_loss_total"`
+	EVLossPerChecked float64        `json:"ev_loss_per_checked"`
 }
 
 type RunConfig struct {
@@ -68,6 +72,8 @@ type RunConfig struct {
 	MinBet        float64 `json:"min_bet"`
 	Fallback      string  `json:"fallback"`
 	ShowCount     bool    `json:"show_count"`
+	Bot           string  `json:"bot"`
+	EVRollouts    int     `json:"ev_rollouts"`
 }
 
 type Summary struct {
@@ -90,7 +96,7 @@ type Report struct {
 	Decisions     DecisionStats `json:"decisions"`
 	Summary       Summary       `json:"summary"`
 	Usage         CallUsage     `json:"usage"`
-	Records       []RoundRecord `json:"records"`
+	Records       []RoundRecord `json:"records,omitempty"`
 }
 
 func bucket(total int) string {
@@ -100,147 +106,278 @@ func bucket(total int) string {
 	return strconv.Itoa(total)
 }
 
-func aggregateSides(records []RoundRecord) (SideStats, SideStats) {
-	p := SideStats{TotalDistribution: map[string]int{}}
-	d := SideStats{TotalDistribution: map[string]int{}}
-	d.MinTotal = 99
-	pMin := 99
-	var pSum, dSum int
-
-	for _, r := range records {
-		d.Hands++
-		if r.DealerBlackjack {
-			d.Blackjacks++
-		}
-		if r.DealerBust {
-			d.Busts++
-		}
-		dSum += r.DealerTotal
-		if r.DealerTotal < d.MinTotal {
-			d.MinTotal = r.DealerTotal
-		}
-		if r.DealerTotal > d.MaxTotal {
-			d.MaxTotal = r.DealerTotal
-		}
-		d.TotalDistribution[bucket(r.DealerTotal)]++
-
-		for _, h := range r.Hands {
-			p.Hands++
-			switch h.Outcome {
-			case "WIN":
-				p.Wins++
-				d.Losses++
-			case "LOSS", "SURRENDER":
-				p.Losses++
-				d.Wins++
-			case "PUSH":
-				p.Pushes++
-				d.Pushes++
-			}
-			if h.Blackjack {
-				p.Blackjacks++
-			}
-			if h.Bust {
-				p.Busts++
-			}
-			pSum += h.Total
-			if h.Total < pMin {
-				pMin = h.Total
-			}
-			if h.Total > p.MaxTotal {
-				p.MaxTotal = h.Total
-			}
-			p.TotalDistribution[bucket(h.Total)]++
-		}
-	}
-
-	if p.Hands > 0 {
-		p.AvgTotal = float64(pSum) / float64(p.Hands)
-	}
-	if d.Hands > 0 {
-		d.AvgTotal = float64(dSum) / float64(d.Hands)
-	}
-	if pMin == 99 {
-		pMin = 0
-	}
-	if d.MinTotal == 99 {
-		d.MinTotal = 0
-	}
-	p.MinTotal = pMin
-	return p, d
+type playerAcc struct {
+	hands      int
+	wins       int
+	losses     int
+	pushes     int
+	blackjacks int
+	busts      int
+	sumTotal   int
+	minTotal   int
+	maxTotal   int
+	dist       map[string]int
+	started    bool
 }
 
-func aggregateBetting(records []RoundRecord, start float64, ruined bool) BettingStats {
-	s := BettingStats{
-		StartBankroll:   start,
-		MinBankroll:     start,
-		Mix:             map[string]int{},
-		ProfitByOption:  map[string]float64{},
-		RoundsByOption:  map[string]int{},
-		WinsByOption:    map[string]int{},
-		WinRateByOption: map[string]float64{},
+func (a *playerAcc) add(h HandRecord) {
+	if !a.started {
+		a.dist = map[string]int{}
+		a.minTotal = h.Total
+		a.maxTotal = h.Total
+		a.started = true
 	}
+	a.hands++
+	switch h.Outcome {
+	case "WIN":
+		a.wins++
+	case "LOSS", "SURRENDER":
+		a.losses++
+	case "PUSH":
+		a.pushes++
+	}
+	if h.Blackjack {
+		a.blackjacks++
+	}
+	if h.Bust {
+		a.busts++
+	}
+	a.sumTotal += h.Total
+	if h.Total < a.minTotal {
+		a.minTotal = h.Total
+	}
+	if h.Total > a.maxTotal {
+		a.maxTotal = h.Total
+	}
+	a.dist[bucket(h.Total)]++
+}
 
-	peak := start
-	var edgeSum, edgeSumSq float64
-	edgeN := 0
+func (a *playerAcc) addRound(r RoundRecord) {
+	for _, h := range r.Hands {
+		a.add(h)
+	}
+}
 
-	for _, r := range records {
-		s.Rounds++
-		s.TotalWagered += r.Bet
-		s.Mix[r.BetOption]++
-		s.RoundsByOption[r.BetOption]++
-		s.ProfitByOption[r.BetOption] += r.Net
+func (a *playerAcc) result() SideStats {
+	s := SideStats{
+		Hands:             a.hands,
+		Wins:              a.wins,
+		Losses:            a.losses,
+		Pushes:            a.pushes,
+		Blackjacks:        a.blackjacks,
+		Busts:             a.busts,
+		MinTotal:          a.minTotal,
+		MaxTotal:          a.maxTotal,
+		TotalDistribution: a.dist,
+	}
+	if s.TotalDistribution == nil {
+		s.TotalDistribution = map[string]int{}
+	}
+	if a.hands > 0 {
+		s.AvgTotal = float64(a.sumTotal) / float64(a.hands)
+	}
+	return s
+}
+
+type dealerAcc struct {
+	rounds     int
+	wins       int
+	losses     int
+	pushes     int
+	blackjacks int
+	busts      int
+	sumTotal   int
+	minTotal   int
+	maxTotal   int
+	dist       map[string]int
+	started    bool
+}
+
+func (a *dealerAcc) add(r RoundRecord) {
+	if !a.started {
+		a.dist = map[string]int{}
+		a.minTotal = r.DealerTotal
+		a.maxTotal = r.DealerTotal
+		a.started = true
+	}
+	a.rounds++
+	if r.DealerBlackjack {
+		a.blackjacks++
+	}
+	if r.DealerBust {
+		a.busts++
+	}
+	a.sumTotal += r.DealerTotal
+	if r.DealerTotal < a.minTotal {
+		a.minTotal = r.DealerTotal
+	}
+	if r.DealerTotal > a.maxTotal {
+		a.maxTotal = r.DealerTotal
+	}
+	a.dist[bucket(r.DealerTotal)]++
+	for _, h := range r.Hands {
+		switch h.Outcome {
+		case "WIN":
+			a.losses++
+		case "LOSS", "SURRENDER":
+			a.wins++
+		case "PUSH":
+			a.pushes++
+		}
+	}
+}
+
+func (a *dealerAcc) result() SideStats {
+	s := SideStats{
+		Hands:             a.rounds,
+		Wins:              a.wins,
+		Losses:            a.losses,
+		Pushes:            a.pushes,
+		Blackjacks:        a.blackjacks,
+		Busts:             a.busts,
+		MinTotal:          a.minTotal,
+		MaxTotal:          a.maxTotal,
+		TotalDistribution: a.dist,
+	}
+	if s.TotalDistribution == nil {
+		s.TotalDistribution = map[string]int{}
+	}
+	if a.rounds > 0 {
+		s.AvgTotal = float64(a.sumTotal) / float64(a.rounds)
+	}
+	return s
+}
+
+type betAcc struct {
+	rounds       int
+	totalWagered float64
+	profit       float64
+	sw           float64
+	swx          float64
+	swxx         float64
+	sww          float64
+	mix          map[string]int
+	profitBy     map[string]float64
+	roundsBy     map[string]int
+	winsBy       map[string]int
+	allInRounds  int
+	allInWins    int
+	peak         float64
+	low          float64
+	maxDD        float64
+	started      bool
+}
+
+func (a *betAcc) add(r RoundRecord, start float64) {
+	if !a.started {
+		a.mix = map[string]int{}
+		a.profitBy = map[string]float64{}
+		a.roundsBy = map[string]int{}
+		a.winsBy = map[string]int{}
+		a.peak = start
+		a.low = start
+		a.started = true
+	}
+	a.rounds++
+	roundWagered := r.Bet
+	if len(r.Hands) > 0 {
+		sum := 0.0
+		for _, h := range r.Hands {
+			sum += h.Wagered
+		}
+		if sum > 0 {
+			roundWagered = sum
+		}
+	}
+	a.totalWagered += roundWagered
+	a.profit += r.Net
+	a.mix[r.BetOption]++
+	a.roundsBy[r.BetOption]++
+	a.profitBy[r.BetOption] += r.Net
+	if r.Net > 0 {
+		a.winsBy[r.BetOption]++
+	}
+	if r.BetOption == "all_in" {
+		a.allInRounds++
 		if r.Net > 0 {
-			s.WinsByOption[r.BetOption]++
-		}
-		if r.BetOption == "all_in" {
-			s.AllInRounds++
-			if r.Net > 0 {
-				s.AllInWins++
-			}
-		}
-		if r.Bet > 0 {
-			x := -r.Net / r.Bet
-			edgeSum += x
-			edgeSumSq += x * x
-			edgeN++
-		}
-		if r.BankrollAfter > peak {
-			peak = r.BankrollAfter
-		}
-		if r.BankrollAfter < s.MinBankroll {
-			s.MinBankroll = r.BankrollAfter
-		}
-		if dd := peak - r.BankrollAfter; dd > s.MaxDrawdown {
-			s.MaxDrawdown = dd
+			a.allInWins++
 		}
 	}
+	if roundWagered > 0 {
+		w := roundWagered
+		x := -r.Net / roundWagered
+		a.sw += w
+		a.swx += w * x
+		a.swxx += w * x * x
+		a.sww += w * w
+	}
+	if r.BankrollAfter > a.peak {
+		a.peak = r.BankrollAfter
+	}
+	if r.BankrollAfter < a.low {
+		a.low = r.BankrollAfter
+	}
+	if dd := a.peak - r.BankrollAfter; dd > a.maxDD {
+		a.maxDD = dd
+	}
+}
 
-	if len(records) > 0 {
-		s.EndBankroll = records[len(records)-1].BankrollAfter
-	} else {
-		s.EndBankroll = start
+func (a *betAcc) result(start float64, end float64, ruined bool) BettingStats {
+	s := BettingStats{
+		Rounds:          a.rounds,
+		StartBankroll:   start,
+		EndBankroll:     end,
+		PeakBankroll:    a.peak,
+		MinBankroll:     a.low,
+		Profit:          a.profit,
+		TotalWagered:    a.totalWagered,
+		MaxDrawdown:     a.maxDD,
+		Ruined:          ruined,
+		Mix:             a.mix,
+		ProfitByOption:  a.profitBy,
+		RoundsByOption:  a.roundsBy,
+		WinsByOption:    a.winsBy,
+		WinRateByOption: map[string]float64{},
+		AllInRounds:     a.allInRounds,
+		AllInWins:       a.allInWins,
 	}
-	s.PeakBankroll = peak
-	s.Profit = s.EndBankroll - start
-	s.Ruined = ruined
+	if s.Mix == nil {
+		s.Mix = map[string]int{}
+	}
+	if s.ProfitByOption == nil {
+		s.ProfitByOption = map[string]float64{}
+	}
+	if s.RoundsByOption == nil {
+		s.RoundsByOption = map[string]int{}
+	}
+	if s.WinsByOption == nil {
+		s.WinsByOption = map[string]int{}
+	}
+	if a.rounds == 0 {
+		s.PeakBankroll = start
+		s.MinBankroll = start
+	}
 	if s.TotalWagered > 0 {
 		s.RTP = (s.TotalWagered + s.Profit) / s.TotalWagered
 		s.HouseEdge = -s.Profit / s.TotalWagered
 	}
-	if s.Rounds > 0 {
-		s.AvgBet = s.TotalWagered / float64(s.Rounds)
+	if a.rounds > 0 {
+		s.AvgBet = s.TotalWagered / float64(a.rounds)
 	}
-	if edgeN > 0 {
-		mean := edgeSum / float64(edgeN)
-		variance := edgeSumSq/float64(edgeN) - mean*mean
-		if variance < 0 {
-			variance = 0
+	if a.sw > 0 && a.sww > 0 {
+		nEff := a.sw * a.sw / a.sww
+		denom := a.sw - a.sww/a.sw
+		if denom > 0 {
+			mean := a.swx / a.sw
+			variance := (a.swxx - 2*mean*a.swx + mean*mean*a.sw) / denom
+			if variance < 0 {
+				variance = 0
+			}
+			se := math.Sqrt(variance / nEff)
+			s.EdgeStdErr = se
+			s.EdgeN = nEff
+			s.EdgeCI95 = [2]float64{s.HouseEdge - 1.96*se, s.HouseEdge + 1.96*se}
 		}
-		se := math.Sqrt(variance) / math.Sqrt(float64(edgeN))
-		s.EdgeStdErr = se
-		s.EdgeCI95 = [2]float64{mean - 1.96*se, mean + 1.96*se}
 	}
 	for opt, n := range s.RoundsByOption {
 		if n > 0 {
@@ -250,59 +387,155 @@ func aggregateBetting(records []RoundRecord, start float64, ruined bool) Betting
 	return s
 }
 
-func aggregateDecisions(records []RoundRecord) DecisionStats {
-	s := DecisionStats{ByKind: map[string]int{}, ByAction: map[string]int{}}
-	var confSum float64
-	var confN int
-	var brierSum float64
-	var latencySum int64
+type decAcc struct {
+	total            int
+	byKind           map[string]int
+	byAction         map[string]int
+	fallbacks        int
+	errors           int
+	confSum          float64
+	confN            int
+	brierSum         float64
+	brierN           int
+	agreementChecked int
+	agreementCount   int
+	latencySum       int64
+	evChecked        int
+	evLossSum        float64
+}
 
-	for _, r := range records {
-		for _, d := range r.Decisions {
-			s.Total++
-			s.ByKind[d.Kind]++
-			s.ByAction[d.Action]++
-			latencySum += d.LatencyMs
-			if d.Fallback {
-				s.Fallbacks++
-			}
-			if d.Error != "" {
-				s.Errors++
+func (a *decAcc) add(r RoundRecord) {
+	if a.byKind == nil {
+		a.byKind = map[string]int{}
+		a.byAction = map[string]int{}
+	}
+	for _, d := range r.Decisions {
+		a.total++
+		a.byKind[d.Kind]++
+		a.byAction[d.Action]++
+		a.latencySum += d.LatencyMs
+		if d.Fallback {
+			a.fallbacks++
+		}
+		if d.Error != "" {
+			a.errors++
+		}
+		if d.Confidence > 0 {
+			a.confSum += d.Confidence
+			a.confN++
+		}
+		if d.Agrees != nil {
+			a.agreementChecked++
+			if *d.Agrees {
+				a.agreementCount++
 			}
 			if d.Confidence > 0 {
-				confSum += d.Confidence
-				confN++
-			}
-			if d.Agrees != nil {
-				s.AgreementChecked++
+				correct := 0.0
 				if *d.Agrees {
-					s.AgreementCount++
+					correct = 1
 				}
-				if d.Confidence > 0 {
-					correct := 0.0
-					if *d.Agrees {
-						correct = 1
-					}
-					brierSum += (d.Confidence - correct) * (d.Confidence - correct)
-					s.BrierN++
-				}
+				a.brierSum += (d.Confidence - correct) * (d.Confidence - correct)
+				a.brierN++
 			}
 		}
+		if d.EVChecked {
+			a.evChecked++
+			a.evLossSum += d.EVLoss
+		}
 	}
+}
 
-	if confN > 0 {
-		s.AvgConfidence = confSum / float64(confN)
+func (a *decAcc) result() DecisionStats {
+	s := DecisionStats{
+		Total:            a.total,
+		ByKind:           a.byKind,
+		ByAction:         a.byAction,
+		Fallbacks:        a.fallbacks,
+		Errors:           a.errors,
+		BrierN:           a.brierN,
+		AgreementChecked: a.agreementChecked,
+		AgreementCount:   a.agreementCount,
+		EVChecked:        a.evChecked,
+		EVLossTotal:      a.evLossSum,
 	}
-	if s.BrierN > 0 {
-		s.BrierScore = brierSum / float64(s.BrierN)
+	if s.ByKind == nil {
+		s.ByKind = map[string]int{}
 	}
-	if s.AgreementChecked > 0 {
-		s.AgreementRate = float64(s.AgreementCount) / float64(s.AgreementChecked)
+	if s.ByAction == nil {
+		s.ByAction = map[string]int{}
 	}
-	if s.Total > 0 {
-		s.AvgLatencyMs = float64(latencySum) / float64(s.Total)
+	if a.confN > 0 {
+		s.AvgConfidence = a.confSum / float64(a.confN)
+	}
+	if a.brierN > 0 {
+		s.BrierScore = a.brierSum / float64(a.brierN)
+	}
+	if a.agreementChecked > 0 {
+		s.AgreementRate = float64(a.agreementCount) / float64(a.agreementChecked)
+	}
+	if a.total > 0 {
+		s.AvgLatencyMs = float64(a.latencySum) / float64(a.total)
+	}
+	if a.evChecked > 0 {
+		s.EVLossPerChecked = a.evLossSum / float64(a.evChecked)
 	}
 	return s
+}
+
+type Accumulator struct {
+	player  playerAcc
+	dealer  dealerAcc
+	bet     betAcc
+	dec     decAcc
+	start   float64
+	lastEnd float64
+}
+
+func NewAccumulator(start float64) *Accumulator {
+	return &Accumulator{start: start, lastEnd: start}
+}
+
+func (a *Accumulator) Add(r RoundRecord) {
+	a.player.addRound(r)
+	a.dealer.add(r)
+	a.bet.add(r, a.start)
+	a.dec.add(r)
+	a.lastEnd = r.BankrollAfter
+}
+
+func (a *Accumulator) Player() SideStats { return a.player.result() }
+
+func (a *Accumulator) Dealer() SideStats { return a.dealer.result() }
+
+func (a *Accumulator) Betting(ruined bool) BettingStats {
+	return a.bet.result(a.start, a.lastEnd, ruined)
+}
+
+func (a *Accumulator) Decisions() DecisionStats { return a.dec.result() }
+
+func aggregateSides(records []RoundRecord) (SideStats, SideStats) {
+	acc := NewAccumulator(0)
+	for _, r := range records {
+		acc.player.addRound(r)
+		acc.dealer.add(r)
+	}
+	return acc.Player(), acc.Dealer()
+}
+
+func aggregateBetting(records []RoundRecord, start float64, ruined bool) BettingStats {
+	acc := NewAccumulator(start)
+	for _, r := range records {
+		acc.bet.add(r, start)
+	}
+	return acc.Betting(ruined)
+}
+
+func aggregateDecisions(records []RoundRecord) DecisionStats {
+	acc := NewAccumulator(0)
+	for _, r := range records {
+		acc.dec.add(r)
+	}
+	return acc.Decisions()
 }
 
 func totalUsage(records []RoundRecord) CallUsage {

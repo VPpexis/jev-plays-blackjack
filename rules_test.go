@@ -7,6 +7,7 @@ func baseRules() Rules {
 		Decks:            6,
 		Penetration:      0.75,
 		BlackjackPays:    1.5,
+		DealerPeeks:      true,
 		DoubleAllowed:    true,
 		DoubleAnyTwo:     true,
 		DoubleAfterSplit: true,

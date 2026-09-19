@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"reflect"
 	"testing"
 )
 
@@ -109,5 +110,71 @@ func TestAggregateDecisions(t *testing.T) {
 	}
 	if d.ByAction["stand"] != 1 || d.ByAction["hit"] != 1 {
 		t.Fatalf("action mix wrong: %+v", d.ByAction)
+	}
+}
+
+func TestEdgeCIContainsHeadline(t *testing.T) {
+	records := []RoundRecord{
+		{Bet: 100, BetOption: "bet_10", Net: -20, BankrollBefore: 1000, BankrollAfter: 980},
+		{Bet: 10, BetOption: "bet_10", Net: 5, BankrollBefore: 980, BankrollAfter: 985},
+		{Bet: 50, BetOption: "bet_10", Net: -30, BankrollBefore: 985, BankrollAfter: 955},
+		{Bet: 20, BetOption: "bet_10", Net: 10, BankrollBefore: 955, BankrollAfter: 965},
+	}
+	b := aggregateBetting(records, 1000, false)
+	if b.EdgeCI95[0] > b.HouseEdge || b.HouseEdge > b.EdgeCI95[1] {
+		t.Fatalf("headline edge %.4f should lie inside CI %v", b.HouseEdge, b.EdgeCI95)
+	}
+	if b.EdgeN <= 0 {
+		t.Fatalf("effective sample size should be positive, got %v", b.EdgeN)
+	}
+}
+
+func TestEVAccumulation(t *testing.T) {
+	agree := true
+	records := []RoundRecord{
+		{
+			Decisions: []DecisionRecord{
+				{Kind: "action", Action: "stand", Agrees: &agree, EVLoss: 0.05, EVChecked: true},
+				{Kind: "action", Action: "hit", Agrees: &agree, EVLoss: 0.15, EVChecked: true},
+			},
+		},
+	}
+	d := aggregateDecisions(records)
+	if d.EVChecked != 2 {
+		t.Fatalf("expected 2 EV-checked decisions, got %d", d.EVChecked)
+	}
+	if math.Abs(d.EVLossTotal-0.2) > 1e-9 {
+		t.Fatalf("expected total EV loss 0.2, got %v", d.EVLossTotal)
+	}
+	if math.Abs(d.EVLossPerChecked-0.1) > 1e-9 {
+		t.Fatalf("expected per-decision EV loss 0.1, got %v", d.EVLossPerChecked)
+	}
+}
+
+func TestAccumulatorMatchesAggregates(t *testing.T) {
+	records := sampleRecords()
+	p1, d1 := aggregateSides(records)
+	b1 := aggregateBetting(records, 100, false)
+	x1 := aggregateDecisions(records)
+
+	acc := NewAccumulator(100)
+	for _, r := range records {
+		acc.Add(r)
+	}
+	p2, d2 := acc.Player(), acc.Dealer()
+	b2 := acc.Betting(false)
+	x2 := acc.Decisions()
+
+	if !reflect.DeepEqual(p1, p2) {
+		t.Fatalf("player stats differ:\n%+v\n%+v", p1, p2)
+	}
+	if !reflect.DeepEqual(d1, d2) {
+		t.Fatalf("dealer stats differ:\n%+v\n%+v", d1, d2)
+	}
+	if !reflect.DeepEqual(b1, b2) {
+		t.Fatalf("betting stats differ:\n%+v\n%+v", b1, b2)
+	}
+	if !reflect.DeepEqual(x1, x2) {
+		t.Fatalf("decision stats differ:\n%+v\n%+v", x1, x2)
 	}
 }

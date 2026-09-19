@@ -121,6 +121,8 @@ func (s *Shoe) NeedsShuffle() bool {
 
 func (s *Shoe) Remaining() int { return len(s.cards) - s.next }
 
+func (s *Shoe) RemainingCards() []Card { return s.cards[s.next:] }
+
 func (s *Shoe) Draw() Card {
 	if s.next >= len(s.cards) {
 		s.Shuffle()
